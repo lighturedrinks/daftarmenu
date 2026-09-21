@@ -1559,7 +1559,10 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             const memberDoc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(order.member_phone).get();
             if (memberDoc.exists) {
               const member = { ...memberDoc.data(), __backendId: memberDoc.id };
-              const pointsEarned = Math.floor(Number(order.total_price) / 10000) * 10;
+              // Poin dihitung dari harga minuman saja (drink_total), exclude ongkir.
+              // Fallback ke total_price untuk order lama yang belum punya field drink_total.
+              const drinkBase = Number(order.drink_total ?? order.total_price);
+              const pointsEarned = Math.floor(drinkBase / 10000) * 10;
               if (pointsEarned > 0) {
                 await memberDataSdk.awardPoints(member, pointsEarned);
               }
@@ -1760,6 +1763,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             customer_name: name, 
             phone_number: phone, 
             items_ordered: items,
+            drink_total: getCartTotal(),
             total_price: total, 
             notes: notes, 
             order_date: new Date().toISOString(),
@@ -1826,6 +1830,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
                 customer_name: name, 
                 phone_number: phone, 
                 items_ordered: items,
+                drink_total: getCartTotal(),
                 total_price: total, 
                 notes: notes, 
                 order_date: new Date().toISOString(),
