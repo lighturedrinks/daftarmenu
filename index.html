@@ -290,13 +290,14 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
      </div>
     </div>
    </div>
-  </div><!-- PIN Modal -->
+  </div><!-- PIN Modal (sekarang Login Admin Google) -->
   <div id="pin-modal" class="pin-modal hidden">
    <div class="pin-modal-content">
-    <h3 data-template-id="pin-heading" class="canva-text font-bold text-center mb-4" style="color: rgb(45, 74, 42); font-weight: 700; font-style: normal; font-size: 18px;">Masukkan PIN Admin</h3><input id="pin-input" type="password" class="pin-input mb-4" maxlength="8" inputmode="numeric" placeholder="00000000">
+    <h3 class="font-bold text-center mb-4" style="color: rgb(45, 74, 42); font-size: 18px;">Login Admin</h3>
     <div id="pin-error" class="text-red-600 text-sm text-center mb-3 hidden"></div>
     <div class="flex gap-3">
-     <button type="button" class="flex-1 py-2 rounded-lg bg-gray-200 text-gray-800 font-medium" onclick="closePinModal()">Batal</button> <button type="button" class="flex-1 py-2 rounded-lg bg-green-500 text-white font-medium" onclick="verifyPin()">Masuk</button>
+     <button type="button" class="flex-1 py-2 rounded-lg bg-gray-200 text-gray-800 font-medium" onclick="closePinModal()">Batal</button>
+     <button type="button" id="google-login-btn" class="flex-1 py-2 rounded-lg bg-green-500 text-white font-medium" onclick="loginAdminGoogle()">Login dengan Google</button>
     </div>
    </div>
   </div><!-- Proof Modal -->
@@ -412,7 +413,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     // password straight to Firebase's servers over HTTPS; it is never
     // stored or compared inside this file, so it can't be read via
     // "View Source" like the old hardcoded PIN could.
-    const ADMIN_EMAIL = 'admin@lighturedrinks.internal';
 
     // Loyalty program config
     const POINTS_PER_RUPIAH = 10 / 10000; // 10 points per Rp10.000 spent, in multiples
@@ -972,7 +972,9 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       }
     });
 
-    // PIN
+    // Admin login (Google)
+    const ADMIN_GOOGLE_EMAIL = 'ururualfi@gmail.com';
+
     let clickCount = 0, clickTimer;
     document.getElementById('brand-title-el').addEventListener('click', () => {
       clickCount++;
@@ -983,36 +985,36 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function openPinModal() {
       document.getElementById('pin-modal').classList.remove('hidden');
-      document.getElementById('pin-input').value = '';
       document.getElementById('pin-error').classList.add('hidden');
-      document.getElementById('pin-input').focus();
     }
     function closePinModal() { document.getElementById('pin-modal').classList.add('hidden'); }
-    async function verifyPin() {
-      const pinInput = document.getElementById('pin-input');
-      const pin = pinInput.value;
-      const submitBtn = document.querySelector('#pin-modal button.bg-green-500');
+
+    async function loginAdminGoogle() {
+      const btn = document.getElementById('google-login-btn');
       const errorEl = document.getElementById('pin-error');
       errorEl.classList.add('hidden');
-      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Memeriksa...'; }
+      btn.disabled = true; btn.textContent = 'Memeriksa...';
       try {
-        // The PIN is sent straight to Firebase's own auth servers for
-        // verification - it is never compared or stored anywhere in this
-        // file, so it can't be read via "View Source" like before.
-        await firebaseAuth.signInWithEmailAndPassword(ADMIN_EMAIL, pin);
+        const provider = new firebase.auth.GoogleAuthProvider();
+        provider.setCustomParameters({ prompt: 'select_account' });
+        const result = await firebaseAuth.signInWithPopup(provider);
+        if (!result.user || result.user.email !== ADMIN_GOOGLE_EMAIL) {
+          await firebaseAuth.signOut();
+          throw new Error('not-admin');
+        }
         closePinModal();
         toggleAdmin();
       } catch (err) {
-        errorEl.textContent = 'PIN salah.';
+        errorEl.textContent = err.message === 'not-admin'
+          ? 'Akun ini bukan admin.'
+          : 'Login gagal: ' + (err.code || err.message);
         errorEl.classList.remove('hidden');
-        pinInput.value = '';
-        pinInput.focus();
       } finally {
-        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Masuk'; }
+        btn.disabled = false; btn.textContent = 'Login dengan Google';
       }
     }
-    document.getElementById('pin-input').addEventListener('keypress', e => { if (e.key === 'Enter') verifyPin(); });
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePinModal(); closeProofModal(); } });
+
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePinModal(); closeProofModal(); } }); { closePinModal(); closeProofModal(); } });
 
     function toggleAdmin() {
       isAdmin = !isAdmin;
