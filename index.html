@@ -376,22 +376,10 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     </div>
    </div>
   </div>
-  <script>
+// Firebase Firestore + Auth backend
+<script>
     // ============================================================
     // Firebase Firestore + Auth backend
-    // ------------------------------------------------------------
-    // Two collections, two trust levels:
-    //   - lighture_stock  : public read (needed to show "Habis" badges
-    //                       to every visitor), write requires admin login.
-    //   - lighture_orders : anyone can CREATE (so guests can checkout),
-    //                       but read/update/delete require admin login.
-    //                       This is what actually protects customer
-    //                       names/phone numbers/payment proof photos -
-    //                       only an authenticated admin session can see
-    //                       or touch existing orders.
-    // The exact allow/deny logic lives in Firestore Security Rules
-    // (configured in the Firebase Console, not in this file - client
-    // code can request anything, but the rules are the real gatekeeper).
     // ============================================================
     const firebaseConfig = {
       apiKey: "AIzaSyCaueKccWhZP980oKGT_ZvXtb2Angv-Rpo",
@@ -404,50 +392,30 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     const firebaseApp = firebase.initializeApp(firebaseConfig);
     const firestoreDb = firebase.firestore();
     const firebaseAuth = firebase.auth();
-    // Keep the admin session tied to this browser tab only - closing the
-    // tab/browser forces a fresh PIN entry next time, so a shared/public
-    // device doesn't stay silently logged in as admin forever.
     firebaseAuth.setPersistence(firebase.auth.Auth.Persistence.SESSION).catch(() => {});
+
+    const ADMIN_GOOGLE_EMAIL = 'ururualfi@gmail.com';
 
     const STOCK_COLLECTION = 'lighture_stock';
     const ORDERS_COLLECTION = 'lighture_orders';
     const MEMBERS_COLLECTION = 'lighture_members';
-    // Vouchers live in a SUBCOLLECTION under each member document
-    // (lighture_members/{phone}/vouchers/{voucherId}) rather than one flat
-    // top-level collection. This matters for privacy: a flat collection
-    // with open read access lets anyone query and download every
-    // customer's phone number in a single request. Scoping vouchers under
-    // their owning member's document means you'd have to already know a
-    // specific phone number to look up that phone's vouchers - you can no
-    // longer list "every voucher for every customer" in one shot.
-    function voucherCollectionFor(phone) {
-      return firestoreDb.collection(MEMBERS_COLLECTION).doc(phone).collection('vouchers');
+    // Voucher disimpan di subcollection milik tiap member: lighture_members/{uid}/vouchers/{id}
+    function voucherCollectionFor(uid) {
+      return firestoreDb.collection(MEMBERS_COLLECTION).doc(uid).collection('vouchers');
     }
-    // Not a real inbox - just a fixed identifier Firebase Auth uses to tell
-    // "the admin account" apart. The PIN typed in the UI is sent as the
-    // password straight to Firebase's servers over HTTPS; it is never
-    // stored or compared inside this file, so it can't be read via
-    // "View Source" like the old hardcoded PIN could.
 
-    // Loyalty program config
-    const POINTS_PER_RUPIAH = 10 / 10000; // 10 points per Rp10.000 spent, in multiples
+    // Loyalty program config (harus sama dengan angka di Firestore Rules: 80 poin, kode YEY5RB)
     const VOUCHER_CATALOG = [
       { code: 'YEY5RB', label: 'Diskon Rp5.000', cost: 80, discount: 5000 }
     ];
 
     // Delivery distance config
-    // Measured from SMKN 10 Jakarta (Jl. SMEA 6 Mayjend Sutoyo, Cawang,
-    // Kramat Jati, Jakarta Timur) - the shop's reference point for
-    // calculating delivery distance.
     const SHOP_LOCATION = { lat: -6.2558, lng: 106.8697 };
     const FREE_DELIVERY_RADIUS_KM = 3;
     const DELIVERY_FEE_PER_KM = 2000;
 
-    // Straight-line ("as the crow flies") distance in km between two
-    // lat/lng points. This is an estimate, not actual road distance -
-    // getting real driving distance would need a paid routing API.
     function haversineDistanceKm(lat1, lng1, lat2, lng2) {
-      const R = 6371; // Earth radius in km
+      const R = 6371;
       const dLat = (lat2 - lat1) * Math.PI / 180;
       const dLng = (lng2 - lng1) * Math.PI / 180;
       const a = Math.sin(dLat / 2) ** 2 +
@@ -459,8 +427,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function calcDeliveryFee(distanceKm) {
       if (distanceKm <= FREE_DELIVERY_RADIUS_KM) return 0;
-      // Standard rounding: fraction >= 0.5 rounds up, otherwise rounds down.
-      // (Previously always rounded up regardless of the fraction.)
       const excessKm = Math.round(distanceKm - FREE_DELIVERY_RADIUS_KM);
       return excessKm * DELIVERY_FEE_PER_KM;
     }
@@ -514,47 +480,22 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     };
 
     // ------------------------------------------------------------
-    // Loyalty points helpers
+    // Member (login Google, ID dokumen = uid)
     // ------------------------------------------------------------
-    // PIN is hashed (SHA-256, salted with the phone number) before it ever
-    // leaves the browser - not perfect security (there's no real backend
-    // to keep a secret server-side pepper), but far better than storing
-    // or comparing PINs in plaintext, and this collection is openly
-    // readable the same way the rest of this app's data is.
-    async function hashMemberPin(phone, pin) {
-      const enc = new TextEncoder().encode(`lighture:${phone}:${pin}`);
-      const digest = await crypto.subtle.digest('SHA-256', enc);
-      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-    }
-
     function sanitizePhoneForId(phone) {
       return String(phone).replace(/[^0-9]/g, '');
     }
 
     const memberDataSdk = {
-      async register(phone, name, pin) {
-        try {
-          const id = sanitizePhoneForId(phone);
-          const existing = await firestoreDb.collection(MEMBERS_COLLECTION).doc(id).get();
-          if (existing.exists) throw new Error('already-exists');
-          const pin_hash = await hashMemberPin(id, pin);
-          await firestoreDb.collection(MEMBERS_COLLECTION).doc(id).set({
-            phone: id, name, pin_hash, points: 0
-          });
-          return { isOk: true, member: { __backendId: id, phone: id, name, pin_hash, points: 0 } };
-        } catch (err) {
-          return { isOk: false, error: { message: err.message } };
-        }
+      async getMember(uid) {
+        const doc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(uid).get();
+        return doc.exists ? { ...doc.data(), __backendId: doc.id } : null;
       },
-      async login(phone, pin) {
+      async register(user, name, phone) {
         try {
-          const id = sanitizePhoneForId(phone);
-          const doc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(id).get();
-          if (!doc.exists) throw new Error('not-found');
-          const data = doc.data();
-          const pin_hash = await hashMemberPin(id, pin);
-          if (pin_hash !== data.pin_hash) throw new Error('wrong-pin');
-          return { isOk: true, member: { ...data, __backendId: id } };
+          const data = { name, phone, email: user.email, points: 0, created_at: new Date().toISOString() };
+          await firestoreDb.collection(MEMBERS_COLLECTION).doc(user.uid).set(data);
+          return { isOk: true, member: { ...data, __backendId: user.uid } };
         } catch (err) {
           return { isOk: false, error: { message: err.message } };
         }
@@ -563,11 +504,11 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         try {
           if (member.points < catalogItem.cost) throw new Error('not-enough-points');
           const batch = firestoreDb.batch();
-          const memberRef = firestoreDb.collection(MEMBERS_COLLECTION).doc(member.__backendId);
-          batch.update(memberRef, { points: member.points - catalogItem.cost });
-          const voucherRef = voucherCollectionFor(member.__backendId).doc();
-          batch.set(voucherRef, {
-            owner_phone: member.__backendId,
+          batch.update(firestoreDb.collection(MEMBERS_COLLECTION).doc(member.__backendId), {
+            points: member.points - catalogItem.cost
+          });
+          batch.set(voucherCollectionFor(member.__backendId).doc(), {
+            owner_phone: member.__backendId, // berisi uid
             code: catalogItem.code,
             label: catalogItem.label,
             discount: catalogItem.discount,
@@ -589,6 +530,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           return { isOk: false, error: { message: err.message } };
         }
       },
+      // Dipanggil dari panel admin
       async awardPoints(member, points) {
         try {
           await firestoreDb.collection(MEMBERS_COLLECTION).doc(member.__backendId).update({
@@ -601,12 +543,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       }
     };
 
-    // Escapes user-supplied text before it's inserted into innerHTML.
-    // Customer name / phone / notes come straight from a public form with
-    // no server-side validation, so without this a malicious order could
-    // inject a <script> or an onerror= handler that runs inside the ADMIN's
-    // browser the moment they open the orders panel (stored XSS). Every
-    // customer-controlled field rendered as HTML below must go through this.
     function escapeHtml(str) {
       if (str === null || str === undefined) return '';
       return String(str)
@@ -617,23 +553,18 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         .replace(/'/g, '&#39;');
     }
 
+    // Nama disamakan dengan yang tampil di menu
     const MENU = [
       { id: '1', name: 'Lychee Tea', price: 5000 },
-      { id: '3', name: 'CheeMilk Boba', price: 10000 },
+      { id: '3', name: 'CheeMilk Tea', price: 10000 },
       { id: '4', name: 'Sora Ice', price: 10000 },
       { id: '5', name: 'Sour White', price: 14000 },
-      { id: '6', name: 'BlueCean', price: 12000 },
+      { id: '6', name: 'SeaGlow', price: 12000 },
       { id: '7', name: 'Cloud Splash', price: 13000 }
     ];
 
     const cart = { '1': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 0 };
-    // ------------------------------------------------------------
     // Anti-spam
-    // ------------------------------------------------------------
-    // Recorded once, when the page/script first runs, so we can tell
-    // apart a genuine customer (who takes at least a few seconds to
-    // browse the menu, fill in their name/phone, etc.) from a script
-    // that fills everything and submits instantly.
     const PAGE_LOADED_AT = Date.now();
     const MIN_CHECKOUT_SECONDS = 4;
     const ORDER_COOLDOWN_SECONDS = 20;
@@ -644,21 +575,21 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     let selectedPaymentMethod = null;
     let currentOrderFilter = 'all';
 
-    // Loyalty member state
-    const MEMBER_SESSION_KEY = 'lighture_member_phone';
-    let currentMember = null;      // { __backendId, phone, name, points, pin_hash }
-    let myVouchers = [];           // unused voucher docs owned by currentMember
-    let selectedVoucher = null;    // voucher chosen at checkout
+    // Member state
+    let currentMember = null;      // { __backendId (uid), phone, name, email, points }
+    let myVouchers = [];
+    let selectedVoucher = null;
     let memberUnsubscribe = null;
     let vouchersUnsubscribe = null;
+    let pendingGoogleUser = null;
 
     // Delivery location state
-    let deliveryLocation = null; // { lat, lng } confirmed by the customer
+    let deliveryLocation = null;
     let deliveryDistanceKm = 0;
-    let deliveryDistanceIsEstimate = false; // true if OSRM routing failed and we fell back to straight-line estimate
+    let deliveryDistanceIsEstimate = false;
     let mapInstance = null;
     let mapMarker = null;
-    let mapPickedLatLng = null; // temp pick inside the modal, before confirming
+    let mapPickedLatLng = null;
 
     function updateTotal() {
       let total = 0;
@@ -718,7 +649,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function buildSummary() {
       const items = MENU.filter(m => cart[m.id] > 0);
-      const rawTotal = getCartTotal();
       populateVoucherSelect();
       const deliveryFee = getDeliveryFee();
       const finalTotal = getFinalTotal();
@@ -749,7 +679,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       select.innerHTML = '<option value="">Tidak pakai voucher</option>' + myVouchers.map(v =>
         `<option value="${v.__backendId}">${escapeHtml(v.label)} (${escapeHtml(v.code)})</option>`
       ).join('');
-      // keep selection if it's still valid, else reset
       if (currentValue && myVouchers.some(v => v.__backendId === currentValue)) {
         select.value = currentValue;
         selectedVoucher = myVouchers.find(v => v.__backendId === currentValue) || null;
@@ -765,24 +694,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     });
 
     // ============================================================
-    // Dynamic QRIS (nominal auto-filled from the cart total)
-    // ------------------------------------------------------------
-    // QRIS_BASE_PAYLOAD is the raw string decoded from the static
-    // QRIS photo (an "open amount" code with no fixed nominal).
-    // To make the amount dynamic, we parse it into its EMVCo fields,
-    // insert/replace the "Transaction Amount" field (tag 54), flip
-    // the Point-of-Initiation-Method field (tag 01) from "11"
-    // (static) to "12" (dynamic), then recompute the CRC16 checksum
-    // (tag 63) that every QRIS code must end with.
-    //
-    // SECURITY: buildDynamicQrisPayload() below only ever touches tags
-    // 01 (POI method) and 54 (amount). Every other field - including
-    // the merchant/NMID identity blocks (26, 51, 59, 60) that determine
-    // WHERE the money actually goes - is copied through untouched from
-    // QRIS_BASE_PAYLOAD. If this file's content itself hasn't been
-    // tampered with (see the GitHub repo's commit history + the
-    // Subresource Integrity lock on the QR library below), the payment
-    // destination can't be silently redirected by this feature.
+    // Dynamic QRIS
     // ============================================================
     const QRIS_BASE_PAYLOAD = "00020101021126610016ID.CO.SHOPEE.WWW01189360091800228744760208228744760303UMI51440014ID.CO.QRIS.WWW0215ID10265007567410303UMI5204594553033605802ID5907PiStore6013JAKARTA TIMUR61051363062070703A0163042B88";
 
@@ -813,11 +725,8 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function buildDynamicQrisPayload(amount) {
       let fields = parseQrisFields(QRIS_BASE_PAYLOAD);
-      // Drop any existing amount (54) and checksum (63) fields - we rebuild both.
       fields = fields.filter(([tag]) => tag !== '54' && tag !== '63');
-      // Mark as a dynamic QR (has a fixed transaction amount).
       fields = fields.map(([tag, value]) => tag === '01' ? [tag, '12'] : [tag, value]);
-      // Insert the amount right after the currency field (53) if present, else at the end.
       const amountStr = String(Math.max(0, Math.round(amount)));
       const amountField = ['54', amountStr];
       const currencyIdx = fields.findIndex(([tag]) => tag === '53');
@@ -848,9 +757,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         const fallback = document.getElementById('qris-static-fallback');
         if (fallback) fallback.classList.add('hidden');
       } catch (err) {
-        // If QR generation fails for any reason, fall back to the static
-        // QRIS image so the customer can still pay (they'll just need to
-        // type the amount manually in their banking/e-wallet app).
         container.innerHTML = '';
         container.classList.add('hidden');
         const fallback = document.getElementById('qris-static-fallback');
@@ -858,7 +764,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       }
     }
 
-    // Payment method selection - initialize
     selectedPaymentMethod = 'qris';
 
     // File upload with compression
@@ -875,37 +780,18 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       return 'proof_' + Math.abs(hash).toString(36);
     }
 
-    // Target size for the compressed proof image. Kept well under typical
-    // per-record storage limits - a previous version allowed images up to
-    // ~1.5MB, which was silently too large for the backend to store and
-    // caused the submit button to crash with a confusing
-    // "Cannot read properties of undefined (reading 'create')" error instead
-    // of a helpful message. Shrinking harder here fixes that at the source.
-    const PROOF_TARGET_BYTES = 220 * 1024; // ~220KB
+    // Rules membatasi payment_proof_data maks 400.000 karakter, jadi target dijaga ~220KB
+    const PROOF_TARGET_BYTES = 220 * 1024;
 
     function compressImage(file) {
       return new Promise((resolve, reject) => {
-        // Accept any image/* file the browser reports (jpeg, png, webp, heic, etc.),
-        // and also fall back to letting it through if the browser didn't set a
-        // proper MIME type (some camera apps / older Androids leave file.type empty).
-        // We no longer hard-reject based on file extension - many valid photos
-        // (screenshots, camera captures) don't have a clean .jpg/.png extension,
-        // and that was incorrectly blocking legitimate payment proof uploads.
         const isLikelyImage = file.type ? file.type.startsWith('image/') : /\.(jpe?g|png|webp|heic|heif|gif|bmp)$/i.test(file.name || '');
-        if (!isLikelyImage) {
-          reject(new Error('invalid_type'));
-          return;
-        }
+        if (!isLikelyImage) { reject(new Error('invalid_type')); return; }
         const reader = new FileReader();
         reader.onload = (event) => {
           const img = new Image();
           img.onload = () => {
             if (!img.width || !img.height) { reject(new Error('fail')); return; }
-
-            // Try progressively smaller dimensions/quality until the result
-            // fits comfortably under PROOF_TARGET_BYTES. Always output JPEG
-            // (regardless of source format) since it compresses predictably -
-            // a PNG source can otherwise stay huge no matter the quality value.
             const attempts = [
               { maxWidth: 700, quality: 0.6 },
               { maxWidth: 600, quality: 0.5 },
@@ -913,20 +799,14 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
               { maxWidth: 420, quality: 0.35 },
               { maxWidth: 340, quality: 0.3 },
             ];
-
             const tryAttempt = (i) => {
-              if (i >= attempts.length) {
-                reject(new Error('too_large'));
-                return;
-              }
+              if (i >= attempts.length) { reject(new Error('too_large')); return; }
               const { maxWidth, quality } = attempts[i];
               const canvas = document.createElement('canvas');
               let w = img.width, h = img.height;
               if (w > maxWidth) { h = Math.round((h * maxWidth) / w); w = maxWidth; }
               canvas.width = w; canvas.height = h;
               const ctx = canvas.getContext('2d');
-              // Flatten onto white first in case the source has transparency,
-              // since we're always exporting JPEG (no alpha channel).
               ctx.fillStyle = '#ffffff';
               ctx.fillRect(0, 0, w, h);
               ctx.drawImage(img, 0, 0, w, h);
@@ -936,7 +816,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
                 resolve(blob);
               }, 'image/jpeg', quality);
             };
-
             tryAttempt(0);
           };
           img.onerror = () => reject(new Error('unsupported_format'));
@@ -947,7 +826,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       });
     }
 
-    // Payment method selection with proper toggle
     document.querySelectorAll('.payment-method-option').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.payment-method-option').forEach(b => b.classList.remove('selected'));
@@ -987,9 +865,9 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       }
     });
 
+    // ============================================================
     // Admin login (Google)
-    const ADMIN_GOOGLE_EMAIL = 'ururualfi@gmail.com';
-
+    // ============================================================
     let clickCount = 0, clickTimer;
     document.getElementById('brand-title-el').addEventListener('click', () => {
       clickCount++;
@@ -1017,6 +895,13 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           await firebaseAuth.signOut();
           throw new Error('not-admin');
         }
+        // Kalau ada member yang sedang login di tab ini, sesinya diganti admin
+        if (currentMember) {
+          currentMember = null; myVouchers = []; selectedVoucher = null;
+          if (memberUnsubscribe) { memberUnsubscribe(); memberUnsubscribe = null; }
+          if (vouchersUnsubscribe) { vouchersUnsubscribe(); vouchersUnsubscribe = null; }
+          renderMemberWidget();
+        }
         closePinModal();
         toggleAdmin();
       } catch (err) {
@@ -1036,8 +921,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       document.getElementById('customer-view').classList.toggle('hidden', isAdmin);
       document.getElementById('admin-view').classList.toggle('hidden', !isAdmin);
       if (isAdmin) {
-        // Only start reading orders after a real, verified admin login -
-        // this is the piece that actually keeps customer data private.
         startOrdersListener();
         renderStockTab();
       } else {
@@ -1047,7 +930,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     }
 
     // ============================================================
-    // Loyalty member widget, login/register, points & vouchers
+    // Member: widget, login Google, poin & voucher
     // ============================================================
     function renderMemberWidget() {
       const el = document.getElementById('member-widget');
@@ -1055,7 +938,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         el.innerHTML = `
           <div class="flex items-center gap-2 text-sm bg-white/80 rounded-full px-4 py-1.5 shadow-sm">
             <span>👋 Halo, <strong>${escapeHtml(currentMember.name)}</strong></span>
-            <span class="text-green-700 font-bold">• ${currentMember.points} Poin</span>
+            <span class="text-green-700 font-bold">• ${currentMember.points || 0} Poin</span>
             <button type="button" class="text-xs underline text-gray-500" onclick="openRedeemModal()">Tukar Poin</button>
             <button type="button" class="text-xs underline text-gray-400" onclick="logoutMember()">Logout</button>
           </div>`;
@@ -1068,72 +951,80 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     }
 
     function openMemberModal() {
+      pendingGoogleUser = null;
       document.getElementById('member-modal').classList.remove('hidden');
       document.getElementById('member-error').classList.add('hidden');
-      document.getElementById('member-name').value = currentMember ? currentMember.name : '';
-      document.getElementById('member-phone').value = currentMember ? currentMember.phone : '';
-      document.getElementById('member-pin').value = '';
+      document.getElementById('member-register-fields').classList.add('hidden');
+      document.getElementById('member-modal-hint').textContent = 'Masuk dengan akun Google. Member baru akan diminta melengkapi nama & no. HP.';
+      document.getElementById('member-login-btn').textContent = 'Login dengan Google';
     }
     function closeMemberModal() { document.getElementById('member-modal').classList.add('hidden'); }
 
     async function memberLoginOrRegister() {
-      const name = document.getElementById('member-name').value.trim();
-      const phoneRaw = document.getElementById('member-phone').value.trim();
-      const pin = document.getElementById('member-pin').value.trim();
       const errorEl = document.getElementById('member-error');
       const btn = document.getElementById('member-login-btn');
+      const showErr = (m) => { errorEl.textContent = m; errorEl.classList.remove('hidden'); };
       errorEl.classList.add('hidden');
-
-      const phone = sanitizePhoneForId(phoneRaw);
-      if (!phone || phone.length < 8) { errorEl.textContent = 'Nomor HP tidak valid.'; errorEl.classList.remove('hidden'); return; }
-      if (!/^\d{4}$/.test(pin)) { errorEl.textContent = 'PIN harus 4 digit angka.'; errorEl.classList.remove('hidden'); return; }
-
-      btn.disabled = true; btn.textContent = 'Memeriksa...';
+      btn.disabled = true;
       try {
-        // Try logging in first (existing member)
-        const loginResult = await memberDataSdk.login(phone, pin);
-        if (loginResult.isOk) {
-          setCurrentMember(loginResult.member);
+        // Langkah 2: member baru melengkapi data
+        if (pendingGoogleUser) {
+          const name = document.getElementById('member-name').value.trim();
+          const phone = sanitizePhoneForId(document.getElementById('member-phone').value);
+          if (!name) return showErr('Nama wajib diisi.');
+          if (phone.length < 8 || phone.length > 20) return showErr('Nomor HP tidak valid.');
+          const r = await memberDataSdk.register(pendingGoogleUser, name, phone);
+          if (!r.isOk) return showErr('Gagal mendaftar: ' + r.error.message);
+          pendingGoogleUser = null;
+          setCurrentMember(r.member);
           closeMemberModal();
           return;
         }
-        if (loginResult.error.message === 'wrong-pin') {
-          errorEl.textContent = 'PIN salah untuk nomor ini.';
-          errorEl.classList.remove('hidden');
-          return;
+
+        // Langkah 1: login Google
+        const provider = new firebase.auth.GoogleAuthProvider();
+        provider.setCustomParameters({ prompt: 'select_account' });
+        const { user } = await firebaseAuth.signInWithPopup(provider);
+        if (user.email === ADMIN_GOOGLE_EMAIL) {
+          await firebaseAuth.signOut();
+          return showErr('Akun admin tidak bisa dipakai sebagai member.');
         }
-        // Not found -> register a new member
-        if (!name) { errorEl.textContent = 'Isi nama untuk daftar akun baru.'; errorEl.classList.remove('hidden'); return; }
-        const registerResult = await memberDataSdk.register(phone, name, pin);
-        if (registerResult.isOk) {
-          setCurrentMember(registerResult.member);
+        const existing = await memberDataSdk.getMember(user.uid);
+        if (existing) {
+          setCurrentMember(existing);
           closeMemberModal();
         } else {
-          errorEl.textContent = 'Gagal mendaftar: ' + (registerResult.error.message || 'coba lagi.');
-          errorEl.classList.remove('hidden');
+          pendingGoogleUser = user;
+          document.getElementById('member-name').value = user.displayName || '';
+          document.getElementById('member-register-fields').classList.remove('hidden');
+          document.getElementById('member-modal-hint').textContent = 'Akun Google terdeteksi. Lengkapi data untuk daftar member.';
+          btn.textContent = 'Daftar';
         }
       } catch (err) {
-        errorEl.textContent = 'Terjadi kesalahan. Coba lagi.';
-        errorEl.classList.remove('hidden');
+        showErr('Login gagal: ' + (err.code || err.message));
       } finally {
-        btn.disabled = false; btn.textContent = 'Masuk';
+        btn.disabled = false;
       }
     }
 
     function setCurrentMember(member) {
       currentMember = member;
-      try { localStorage.setItem(MEMBER_SESSION_KEY, member.__backendId); } catch (e) {}
       renderMemberWidget();
       startMemberListeners();
+      // Isi otomatis form pesanan kalau masih kosong
+      const nameEl = document.getElementById('cust-name');
+      const phoneEl = document.getElementById('cust-phone');
+      if (nameEl && !nameEl.value) nameEl.value = member.name || '';
+      if (phoneEl && !phoneEl.value) phoneEl.value = member.phone || '';
     }
 
     function logoutMember() {
       currentMember = null;
       myVouchers = [];
       selectedVoucher = null;
-      try { localStorage.removeItem(MEMBER_SESSION_KEY); } catch (e) {}
       if (memberUnsubscribe) { memberUnsubscribe(); memberUnsubscribe = null; }
       if (vouchersUnsubscribe) { vouchersUnsubscribe(); vouchersUnsubscribe = null; }
+      firebaseAuth.signOut().catch(() => {});
       renderMemberWidget();
       populateVoucherSelect();
     }
@@ -1146,7 +1037,8 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           if (!doc.exists) return;
           currentMember = { ...doc.data(), __backendId: doc.id };
           renderMemberWidget();
-          if (document.getElementById('redeem-modal') && !document.getElementById('redeem-modal').classList.contains('hidden')) renderRedeemModal();
+          const rm = document.getElementById('redeem-modal');
+          if (rm && !rm.classList.contains('hidden')) renderRedeemModal();
         },
         (err) => console.error('Member listen error:', err)
       );
@@ -1157,30 +1049,21 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           (snapshot) => {
             myVouchers = snapshot.docs.map(d => ({ ...d.data(), __backendId: d.id }));
             populateVoucherSelect();
-            if (document.getElementById('redeem-modal') && !document.getElementById('redeem-modal').classList.contains('hidden')) renderRedeemModal();
+            const rm = document.getElementById('redeem-modal');
+            if (rm && !rm.classList.contains('hidden')) renderRedeemModal();
           },
           (err) => console.error('Vouchers listen error:', err)
         );
     }
 
-    // Restore a logged-in member session on page load (no PIN re-entry needed
-    // within the same device/browser, similar to "remember me").
-    (async function restoreMemberSession() {
+    // Pulihkan sesi member kalau tab ini sudah login Google sebelumnya
+    firebaseAuth.onAuthStateChanged(async (user) => {
+      if (!user || user.email === ADMIN_GOOGLE_EMAIL || currentMember || pendingGoogleUser) return;
       try {
-        const savedPhone = localStorage.getItem(MEMBER_SESSION_KEY);
-        if (!savedPhone) return;
-        const doc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(savedPhone).get();
-        if (doc.exists) {
-          currentMember = { ...doc.data(), __backendId: doc.id };
-          renderMemberWidget();
-          startMemberListeners();
-        } else {
-          localStorage.removeItem(MEMBER_SESSION_KEY);
-        }
-      } catch (err) {
-        console.error('Restore member session failed:', err);
-      }
-    })();
+        const m = await memberDataSdk.getMember(user.uid);
+        if (m) setCurrentMember(m);
+      } catch (e) { console.error('Restore member failed:', e); }
+    });
     renderMemberWidget();
 
     function openRedeemModal() {
@@ -1192,15 +1075,16 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function renderRedeemModal() {
       if (!currentMember) return;
-      document.getElementById('redeem-points-balance').textContent = `Poin kamu: ${currentMember.points}`;
+      const pts = currentMember.points || 0;
+      document.getElementById('redeem-points-balance').textContent = `Poin kamu: ${pts}`;
       document.getElementById('redeem-voucher-list').innerHTML = VOUCHER_CATALOG.map(v => `
         <div class="flex items-center justify-between p-3 rounded-lg border border-gray-200">
           <div>
             <p class="font-medium text-sm">${escapeHtml(v.label)}</p>
             <p class="text-xs text-gray-500">Kode: ${escapeHtml(v.code)} • ${v.cost} Poin</p>
           </div>
-          <button type="button" class="px-3 py-1.5 rounded-lg text-sm font-medium ${currentMember.points >= v.cost ? 'bg-green-500 text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}"
-            ${currentMember.points >= v.cost ? `onclick="redeemVoucherCode('${v.code}')"` : 'disabled'}>Tukar</button>
+          <button type="button" class="px-3 py-1.5 rounded-lg text-sm font-medium ${pts >= v.cost ? 'bg-green-500 text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}"
+            ${pts >= v.cost ? `onclick="redeemVoucherCode('${v.code}')"` : 'disabled'}>Tukar</button>
         </div>
       `).join('');
       const myVouchersEl = document.getElementById('redeem-my-vouchers');
@@ -1218,17 +1102,15 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       const errorEl = document.getElementById('redeem-error');
       errorEl.classList.add('hidden');
       const result = await memberDataSdk.redeemVoucher(currentMember, catalogItem);
-      if (result.isOk) {
-        currentMember.points -= catalogItem.cost;
-        renderRedeemModal();
-      } else {
+      if (!result.isOk) {
         errorEl.textContent = 'Gagal menukar poin. Coba lagi.';
         errorEl.classList.remove('hidden');
       }
+      // Poin & daftar voucher diperbarui otomatis oleh listener
     }
 
     // ============================================================
-    // Delivery location map picker (Leaflet + OpenStreetMap, free)
+    // Delivery location map picker
     // ============================================================
     function openMapModal() {
       document.getElementById('map-modal').classList.remove('hidden');
@@ -1236,13 +1118,10 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       document.getElementById('map-search-results').classList.add('hidden');
       document.getElementById('map-search-input').value = '';
 
-      // Start centered on the shop, or the customer's previously picked point.
       const start = deliveryLocation || SHOP_LOCATION;
       mapPickedLatLng = deliveryLocation ? { ...deliveryLocation } : null;
       updateMapDistancePreview();
 
-      // Defer map init slightly so the modal is visible first (Leaflet
-      // needs a visible container with a real size to lay itself out).
       setTimeout(() => {
         if (!mapInstance) {
           mapInstance = L.map('delivery-map').setView([start.lat, start.lng], 14);
@@ -1251,7 +1130,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             maxZoom: 19
           }).addTo(mapInstance);
 
-          // Shop marker (fixed reference point, not draggable)
           L.marker([SHOP_LOCATION.lat, SHOP_LOCATION.lng], {
             icon: L.divIcon({ className: '', html: '🏪', iconSize: [24, 24] })
           }).addTo(mapInstance).bindPopup('Lokasi Toko');
@@ -1283,22 +1161,11 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     function updateMapDistancePreview() {
       const el = document.getElementById('map-distance-preview');
       if (!mapPickedLatLng) { el.textContent = ''; return; }
-      // Fast straight-line estimate for live feedback while dragging/clicking -
-      // the accurate road-distance lookup only happens once, on confirm, so
-      // we don't hammer the routing API on every mouse movement.
       const dist = haversineDistanceKm(SHOP_LOCATION.lat, SHOP_LOCATION.lng, mapPickedLatLng.lat, mapPickedLatLng.lng);
       const fee = calcDeliveryFee(dist);
       el.textContent = `Perkiraan jarak: ~${dist.toFixed(1)} km` + (fee > 0 ? ` • Ongkir: ~Rp ${fee.toLocaleString('id-ID')}` : ' • Gratis ongkir') + ' (jarak akurat dihitung saat konfirmasi)';
     }
 
-    // Real driving-route distance via OSRM (Open Source Routing Machine),
-    // a free routing engine built on OpenStreetMap road data - this follows
-    // actual roads instead of a straight line "as the crow flies".
-    // OSRM's public demo server has no API key, but is meant for light,
-    // reasonable use with no uptime guarantee - so if it's slow, blocked, or
-    // down, we fall back to the straight-line distance multiplied by a
-    // typical road-detour factor (1.3x) rather than leaving the customer
-    // stuck without a distance/fee at all.
     const OSRM_ROAD_DETOUR_FALLBACK_FACTOR = 1.3;
     async function getRoadDistanceKm(lat1, lng1, lat2, lng2) {
       try {
@@ -1313,8 +1180,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         }
         throw new Error('no-route');
       } catch (err) {
-        // Fallback: straight-line distance is always shorter than the real
-        // road route, so we scale it up by a rough average detour factor.
         const straightLine = haversineDistanceKm(lat1, lng1, lat2, lng2);
         return { km: straightLine * OSRM_ROAD_DETOUR_FALLBACK_FACTOR, isRoadDistance: false };
       }
@@ -1353,9 +1218,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       el.className = fee > 0 ? 'text-xs text-orange-600 mt-1 font-medium' : 'text-xs text-green-600 mt-1 font-medium';
     }
 
-    // Address search via Nominatim (OpenStreetMap's free geocoding service).
-    // Debounced so we don't hammer the API on every keystroke - please keep
-    // usage light, Nominatim's public instance is a shared free resource.
     let mapSearchTimer = null;
     document.getElementById('map-search-input').addEventListener('input', (e) => {
       clearTimeout(mapSearchTimer);
@@ -1372,7 +1234,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             resultsEl.classList.remove('hidden');
             return;
           }
-          resultsEl.innerHTML = results.map((r, i) =>
+          resultsEl.innerHTML = results.map((r) =>
             `<button type="button" class="map-search-result-item w-full text-left p-2 hover:bg-gray-50 border-b text-xs" data-lat="${r.lat}" data-lng="${r.lon}">${escapeHtml(r.display_name)}</button>`
           ).join('');
           resultsEl.classList.remove('hidden');
@@ -1395,23 +1257,28 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       document.getElementById('map-search-results').classList.add('hidden');
     });
 
-
-
+    // ============================================================
+    // Admin panel
+    // ============================================================
     function renderAdmin() {
       const container = document.getElementById('admin-orders');
       const filterValue = document.getElementById('order-product-filter')?.value || '';
-      
+
       let filtered = allOrders;
       if (filterValue) {
         const itemId = filterValue;
+        const menuName = MENU.find(m => m.id === itemId)?.name;
+        // Pesanan lama bisa memakai nama lama (BlueCean / CheeMilk Boba)
+        const aliases = { '6': ['SeaGlow', 'BlueCean'], '3': ['CheeMilk Tea', 'CheeMilk Boba'] };
+        const names = aliases[itemId] || [menuName];
         filtered = allOrders.filter(order => {
           const items = order.items_ordered.split(', ');
-          return items.some(item => item.includes(MENU.find(m => m.id === itemId)?.name));
+          return items.some(item => names.some(n => item.includes(n)));
         });
       }
-      
+
       if (!filtered.length) { container.innerHTML = '<p class="text-center text-gray-500 text-sm py-6">Belum ada pesanan.</p>'; return; }
-      container.innerHTML = filtered.map((order, idx) => {
+      container.innerHTML = filtered.map((order) => {
         const sc = { pending: 'bg-yellow-100 text-yellow-800', confirmed: 'bg-blue-100 text-blue-800', preparing: 'bg-purple-100 text-purple-800', completed: 'bg-green-100 text-green-800', rejected: 'bg-red-100 text-red-800' };
         const st = { pending: '⏳ Menunggu', confirmed: '✅ Dikonfirmasi', preparing: '👨‍🍳 Sedang Dibuat', completed: '✔️ Selesai', rejected: '❌ Ditolak' };
         const orderDate = new Date(order.order_date || '');
@@ -1420,7 +1287,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         if (order.status === 'pending') buttons = `<div class="flex gap-2 mt-2"><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-blue-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="confirmed">Konfirmasi</button><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-red-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="rejected">Tolak</button></div>`;
         else if (order.status === 'confirmed') buttons = `<div class="flex gap-2 mt-2"><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-purple-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="preparing">Sedang Dibuat</button><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-red-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="rejected">Tolak</button></div>`;
         else if (order.status === 'preparing') buttons = `<div class="flex gap-2 mt-2"><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-green-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="completed">Selesai</button><button type="button" class="admin-action flex-1 py-1.5 rounded-lg bg-red-500 text-white text-sm font-medium" data-id="${order.__backendId}" data-action="rejected">Tolak</button></div>`;
-        
+
         let proofSection = '';
         if (order.payment_proof_data) {
           proofSection = `<div class="mt-3 pt-3 border-t border-gray-200">
@@ -1428,17 +1295,16 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             <img src="${order.payment_proof_data}" alt="Bukti pembayaran" class="w-full max-h-64 object-contain rounded-lg border border-gray-200 cursor-pointer bg-gray-50" data-id="${order.__backendId}" onclick="showProofModal('${order.__backendId}')">
           </div>`;
         } else if (order.payment_proof_hash) {
-          // Old orders submitted before the fix only have a hash, no image was saved.
           proofSection = `<div class="mt-3 pt-3 border-t border-gray-200">
             <p class="text-xs font-medium text-gray-700 mb-2">🔐 Bukti Pembayaran</p>
-            <p class="text-xs text-gray-500 italic">Gambar bukti tidak tersimpan untuk pesanan lama ini (kode: ${order.payment_proof_hash}).</p>
+            <p class="text-xs text-gray-500 italic">Gambar bukti tidak tersimpan untuk pesanan lama ini (kode: ${escapeHtml(order.payment_proof_hash)}).</p>
           </div>`;
         }
-        
+
         let loyaltyInfo = '';
         if (order.member_phone || order.voucher_code) {
           const parts = [];
-          if (order.member_phone) parts.push(`👤 Member: ${escapeHtml(order.member_phone)}`);
+          if (order.member_phone) parts.push(`👤 Member (ID: ${escapeHtml(String(order.member_phone).slice(0, 8))}…)`);
           if (order.voucher_code) parts.push(`🎟️ Voucher: ${escapeHtml(order.voucher_code)}`);
           if (order.points_awarded && order.points_awarded_amount) parts.push(`⭐ +${order.points_awarded_amount} poin diberikan`);
           loyaltyInfo = `<p class="text-xs text-blue-600 mt-1">${parts.join(' • ')}</p>`;
@@ -1476,7 +1342,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       const fromDate = document.getElementById('report-date-from').value;
       const toDate = document.getElementById('report-date-to').value;
       let filtered = allOrders;
-      
+
       if (fromDate || toDate) {
         const fromDateObj = fromDate ? new Date(fromDate + 'T00:00:00Z') : new Date('1970-01-01');
         const toDateObj = toDate ? new Date(toDate + 'T23:59:59Z') : new Date('2099-12-31');
@@ -1485,7 +1351,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           return orderDate >= fromDateObj && orderDate <= toDateObj;
         });
       }
-      
+
       const o = filtered;
       document.getElementById('report-total-orders-value').textContent = o.length;
       document.getElementById('report-revenue-value').textContent = 'Rp ' + o.filter(x=>x.status!=='rejected').reduce((s,x)=>s+Number(x.total_price),0).toLocaleString('id-ID');
@@ -1494,7 +1360,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       document.getElementById('report-preparing-value').textContent = o.filter(x=>x.status==='preparing').length;
       document.getElementById('report-completed-value').textContent = o.filter(x=>x.status==='completed').length;
       document.getElementById('report-rejected-value').textContent = o.filter(x=>x.status==='rejected').length;
-      
+
       updateDailySalesSummary();
     }
 
@@ -1541,24 +1407,22 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       }).join('');
     }
 
+    // Listener filter tanggal dipasang sekali saja
+    document.getElementById('report-date-from').addEventListener('change', updateReport);
+    document.getElementById('report-date-to').addEventListener('change', updateReport);
+
     function switchAdminTab(tab) {
       document.querySelectorAll('.admin-tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.admin-tab-content').forEach(c => c.classList.add('hidden'));
       document.querySelector(`.admin-tab[data-tab="${tab}"]`).classList.add('active');
       document.getElementById('tab-' + tab + '-content').classList.remove('hidden');
-      if (tab === 'orders') {
-        renderAdmin();
-      }
-      if (tab === 'report') {
-        updateReport();
-        document.getElementById('report-date-from').addEventListener('change', updateReport, { once: false });
-        document.getElementById('report-date-to').addEventListener('change', updateReport, { once: false });
-      }
+      if (tab === 'orders') renderAdmin();
+      if (tab === 'report') updateReport();
       if (tab === 'stock') renderStockTab();
       if (tab === 'sales') updateSalesTab();
     }
 
-    // Admin order actions
+    // Aksi admin pada pesanan
     document.getElementById('admin-orders').addEventListener('click', async e => {
       const actionBtn = e.target.closest('.admin-action');
       if (actionBtn) {
@@ -1567,17 +1431,12 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         actionBtn.disabled = true; actionBtn.textContent = '...';
         const newStatus = actionBtn.dataset.action;
         await window.dataSdk.updateOrder({ ...order, status: newStatus });
-        // Award loyalty points only once, only when an order that was
-        // placed by a logged-in member is confirmed as actually completed
-        // (paid + fulfilled) - this is what stops someone from farming
-        // points via orders that never get paid.
+        // Poin diberikan sekali, hanya saat pesanan member berstatus selesai
         if (newStatus === 'completed' && order.member_phone && !order.points_awarded) {
           try {
             const memberDoc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(order.member_phone).get();
             if (memberDoc.exists) {
               const member = { ...memberDoc.data(), __backendId: memberDoc.id };
-              // Poin dihitung dari harga minuman saja (drink_total), exclude ongkir.
-              // Fallback ke total_price untuk order lama yang belum punya field drink_total.
               const drinkBase = Number(order.drink_total ?? order.total_price);
               const pointsEarned = Math.floor(drinkBase / 10000) * 10;
               if (pointsEarned > 0) {
@@ -1673,8 +1532,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     // ------------------------------------------------------------
     // Data listeners
     // ------------------------------------------------------------
-    // Stock is public: every visitor's browser subscribes to it so
-    // sold-out badges show correctly, no login required.
     let stockUnsubscribe = null;
     function startStockListener() {
       if (stockUnsubscribe) return;
@@ -1692,11 +1549,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       );
     }
 
-    // Orders are private: this listener is only started after a
-    // successful admin sign-in (see toggleAdmin/verifyPin above), and
-    // stopped again on logout. Firestore Security Rules enforce this on
-    // the server side too, so even calling this without being signed in
-    // would just get a permission-denied error and return no data.
     let ordersUnsubscribe = null;
     function startOrdersListener() {
       if (ordersUnsubscribe) return;
@@ -1722,36 +1574,30 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     startStockListener();
 
-    // Filter apply button listener
     document.getElementById('filter-apply-btn').addEventListener('click', renderAdmin);
 
+    // ============================================================
     // Submit order
+    // ============================================================
     document.getElementById('final-submit').addEventListener('click', async () => {
       const btn = document.getElementById('final-submit');
-      const errorEl = document.getElementById('error-msg');
-      
+      const resetBtn = () => {
+        btn.disabled = false; btn.style.opacity = '1';
+        btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
+      };
+
       try {
         if (selectedPaymentMethod === 'qris' && !uploadedProofBlob) { showError('error-msg', 'Upload bukti pembayaran QRIS.'); return; }
 
-        // --- Anti-spam checks ---
-        // 1. Honeypot: a real customer never sees or fills this field.
-        //    If it's filled, silently pretend the order succeeded so a
-        //    bot doesn't learn it was detected and try to adapt.
+        // Anti-spam: honeypot
         const honeypot = document.getElementById('cust-website');
-        if (honeypot && honeypot.value.trim() !== '') {
-          goToStep(4);
-          return;
-        }
-        // 2. Too-fast submission: filling name/phone/items realistically
-        //    takes more than a few seconds. This is a soft check (shown
-        //    as a normal error) since an honest customer could rarely
-        //    trip it via browser autofill.
+        if (honeypot && honeypot.value.trim() !== '') { goToStep(4); return; }
+        // Anti-spam: terlalu cepat
         if (Date.now() - PAGE_LOADED_AT < MIN_CHECKOUT_SECONDS * 1000) {
           showError('error-msg', 'Terjadi kesalahan, silakan coba lagi.');
           return;
         }
-        // 3. Per-browser cooldown: stop the same browser/device from
-        //    firing off many orders back-to-back.
+        // Anti-spam: cooldown per browser
         try {
           const lastOrderAt = Number(localStorage.getItem(LAST_ORDER_STORAGE_KEY) || 0);
           const secondsSinceLast = (Date.now() - lastOrderAt) / 1000;
@@ -1759,144 +1605,92 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             showError('error-msg', `Kamu baru saja memesan. Tunggu ${Math.ceil(ORDER_COOLDOWN_SECONDS - secondsSinceLast)} detik lagi ya.`);
             return;
           }
-        } catch (e) { /* localStorage unavailable - skip cooldown check */ }
+        } catch (e) { /* localStorage tidak tersedia */ }
 
         btn.disabled = true; btn.style.opacity = '0.5';
         btn.textContent = 'Mengirim...';
 
         const items = MENU.filter(m => cart[m.id] > 0).map(m => m.name + ' x' + cart[m.id]).join(', ');
         const total = getFinalTotal();
-        const voucherUsedForThisOrder = selectedVoucher; // captured before any reset
+        const voucherUsedForThisOrder = selectedVoucher;
         const name = document.getElementById('cust-name').value.trim();
         const phone = document.getElementById('cust-phone').value.trim();
         const notes = document.getElementById('cust-notes').value.trim();
         const address = document.getElementById('cust-address').value.trim();
-        const memberPhoneForOrder = currentMember ? currentMember.__backendId : '';
+        const memberUidForOrder = currentMember ? currentMember.__backendId : '';
         const deliveryFeeForOrder = getDeliveryFee();
 
-        if (selectedPaymentMethod === 'cash') {
-          // Cash payment - direct order creation without proof
-          const result = await window.dataSdk.createOrder({
-            customer_name: name, 
-            phone_number: phone, 
-            items_ordered: items,
-            drink_total: getCartTotal(),
-            total_price: total, 
-            notes: notes, 
-            order_date: new Date().toISOString(),
-            payment_proof_hash: '', 
-            payment_proof_data: '',
-            status: 'pending',
-            payment_method: selectedPaymentMethod, 
-            record_type: 'order',
-            member_phone: memberPhoneForOrder,
-            voucher_code: voucherUsedForThisOrder ? voucherUsedForThisOrder.code : '',
-            points_awarded: false,
-            delivery_address: address,
-            delivery_lat: deliveryLocation ? deliveryLocation.lat : null,
-            delivery_lng: deliveryLocation ? deliveryLocation.lng : null,
-            delivery_distance_km: deliveryLocation ? Number(deliveryDistanceKm.toFixed(2)) : null,
-            delivery_distance_is_estimate: deliveryLocation ? deliveryDistanceIsEstimate : null,
-            delivery_fee: deliveryFeeForOrder
-          });
-          
-          btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
-          
-          if (result.isOk) {
-            try { localStorage.setItem(LAST_ORDER_STORAGE_KEY, String(Date.now())); } catch (e) {}
-            if (voucherUsedForThisOrder) {
-              memberDataSdk.markVoucherUsed(voucherUsedForThisOrder).catch(() => {});
-              selectedVoucher = null;
-            }
-            let msg = `Pesanan Baru dari Lighture Drinks%0A%0A👤 ${encodeURIComponent(name)}%0A📞 ${encodeURIComponent(phone)}%0A%0A🛍️ ${encodeURIComponent(items)}%0A💰 Rp ${total.toLocaleString('id-ID')}%0A💵 Tunai`;
-            if (address) msg += `%0A📍 ${encodeURIComponent(address)}`;
-            if (deliveryFeeForOrder > 0) msg += `%0A🚚 Ongkir: Rp ${deliveryFeeForOrder.toLocaleString('id-ID')} (~${deliveryDistanceKm.toFixed(1)} km)`;
-            if (notes) msg += `%0A📝 ${encodeURIComponent(notes)}`;
-            window.open(`https://wa.me/6285172296255?text=${msg}`, '_blank');
-            goToStep(4);
-          } else {
-            showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
+        const buildOrder = (proofHash, proofData) => ({
+          customer_name: name,
+          phone_number: phone,
+          items_ordered: items,
+          drink_total: getCartTotal(),
+          total_price: total,
+          notes: notes,
+          order_date: new Date().toISOString(),
+          payment_proof_hash: proofHash,
+          payment_proof_data: proofData,
+          status: 'pending',
+          payment_method: selectedPaymentMethod,
+          record_type: 'order',
+          member_phone: memberUidForOrder, // berisi uid member
+          voucher_code: voucherUsedForThisOrder ? voucherUsedForThisOrder.code : '',
+          points_awarded: false,
+          delivery_address: address,
+          delivery_lat: deliveryLocation ? deliveryLocation.lat : null,
+          delivery_lng: deliveryLocation ? deliveryLocation.lng : null,
+          delivery_distance_km: deliveryLocation ? Number(deliveryDistanceKm.toFixed(2)) : null,
+          delivery_distance_is_estimate: deliveryLocation ? deliveryDistanceIsEstimate : null,
+          delivery_fee: deliveryFeeForOrder
+        });
+
+        const finishSuccess = (methodLabel) => {
+          try { localStorage.setItem(LAST_ORDER_STORAGE_KEY, String(Date.now())); } catch (e) {}
+          if (voucherUsedForThisOrder) {
+            memberDataSdk.markVoucherUsed(voucherUsedForThisOrder).catch(() => {});
+            selectedVoucher = null;
           }
+          let msg = `Pesanan Baru dari Lighture Drinks%0A%0A👤 ${encodeURIComponent(name)}%0A📞 ${encodeURIComponent(phone)}%0A%0A🛍️ ${encodeURIComponent(items)}%0A💰 Rp ${total.toLocaleString('id-ID')}%0A${methodLabel}`;
+          if (address) msg += `%0A📍 ${encodeURIComponent(address)}`;
+          if (deliveryFeeForOrder > 0) msg += `%0A🚚 Ongkir: Rp ${deliveryFeeForOrder.toLocaleString('id-ID')} (~${deliveryDistanceKm.toFixed(1)} km)`;
+          if (notes) msg += `%0A📝 ${encodeURIComponent(notes)}`;
+          window.open(`https://wa.me/6285172296255?text=${msg}`, '_blank');
+          goToStep(4);
+        };
+
+        if (selectedPaymentMethod === 'cash') {
+          const result = await window.dataSdk.createOrder(buildOrder('', ''));
+          resetBtn();
+          if (result.isOk) finishSuccess('💵 Tunai');
+          else showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
         } else {
-          // QRIS payment - requires proof
           const reader = new FileReader();
           reader.onerror = () => {
-            btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
+            resetBtn();
             showError('error-msg', 'Gagal membaca file bukti. Coba upload lagi.');
           };
           reader.onload = async (event) => {
             try {
               const proofBase64 = event.target.result;
               if (!proofBase64 || proofBase64.length === 0) {
-                btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
+                resetBtn();
                 showError('error-msg', 'Bukti pembayaran kosong. Coba upload lagi.');
                 return;
               }
-              
-              // Keep a short hash for reference, but store the actual compressed
-              // image (base64 data URL) so admin can actually view the proof.
               const proofHash = generateHash(proofBase64);
-
-              if (!window.dataSdk || typeof window.dataSdk.createOrder !== 'function') {
-                btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
-                showError('error-msg', 'Koneksi ke server belum siap. Tunggu sebentar lalu coba kirim lagi.');
-                return;
-              }
-
-              const result = await window.dataSdk.createOrder({
-                customer_name: name, 
-                phone_number: phone, 
-                items_ordered: items,
-                drink_total: getCartTotal(),
-                total_price: total, 
-                notes: notes, 
-                order_date: new Date().toISOString(),
-                payment_proof_hash: proofHash, 
-                payment_proof_data: proofBase64,
-                status: 'pending',
-                payment_method: selectedPaymentMethod, 
-                record_type: 'order',
-                member_phone: memberPhoneForOrder,
-                voucher_code: voucherUsedForThisOrder ? voucherUsedForThisOrder.code : '',
-                points_awarded: false,
-                delivery_address: address,
-                delivery_lat: deliveryLocation ? deliveryLocation.lat : null,
-                delivery_lng: deliveryLocation ? deliveryLocation.lng : null,
-                delivery_distance_km: deliveryLocation ? Number(deliveryDistanceKm.toFixed(2)) : null,
-            delivery_distance_is_estimate: deliveryLocation ? deliveryDistanceIsEstimate : null,
-                delivery_fee: deliveryFeeForOrder
-              });
-              
-              btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
-              
-              if (result.isOk) {
-                try { localStorage.setItem(LAST_ORDER_STORAGE_KEY, String(Date.now())); } catch (e) {}
-                if (voucherUsedForThisOrder) {
-                  memberDataSdk.markVoucherUsed(voucherUsedForThisOrder).catch(() => {});
-                  selectedVoucher = null;
-                }
-                let msg = `Pesanan Baru dari Lighture Drinks%0A%0A👤 ${encodeURIComponent(name)}%0A📞 ${encodeURIComponent(phone)}%0A%0A🛍️ ${encodeURIComponent(items)}%0A💰 Rp ${total.toLocaleString('id-ID')}%0A💳 QRIS`;
-                if (address) msg += `%0A📍 ${encodeURIComponent(address)}`;
-                if (deliveryFeeForOrder > 0) msg += `%0A🚚 Ongkir: Rp ${deliveryFeeForOrder.toLocaleString('id-ID')} (~${deliveryDistanceKm.toFixed(1)} km)`;
-                if (notes) msg += `%0A📝 ${encodeURIComponent(notes)}`;
-                window.open(`https://wa.me/6285172296255?text=${msg}`, '_blank');
-                goToStep(4);
-              } else {
-                showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
-              }
+              const result = await window.dataSdk.createOrder(buildOrder(proofHash, proofBase64));
+              resetBtn();
+              if (result.isOk) finishSuccess('💳 QRIS');
+              else showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
             } catch (err) {
-              btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
-              const rawMsg = err && err.message ? err.message : '';
-              const friendlyMsg = /undefined|null/i.test(rawMsg)
-                ? 'Gagal mengirim pesanan karena masalah koneksi ke server. Coba lagi dalam beberapa saat.'
-                : 'Error: ' + (rawMsg || 'Gagal memproses pesanan');
-              showError('error-msg', friendlyMsg);
+              resetBtn();
+              showError('error-msg', 'Error: ' + (err.message || 'Gagal memproses pesanan'));
             }
           };
           reader.readAsDataURL(uploadedProofBlob);
         }
       } catch (err) {
-        btn.disabled = false; btn.style.opacity = '1'; btn.textContent = document.querySelector('[data-template-id="submit-btn"]')?.textContent || 'Kirim Pesanan';
+        resetBtn();
         showError('error-msg', 'Error: ' + (err.message || 'Terjadi kesalahan'));
       }
     });
@@ -1904,8 +1698,8 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     function resetOrder() {
       Object.keys(cart).forEach(k => { cart[k] = 0; const el = document.getElementById('qty-'+k); if(el) el.textContent = '0'; });
       updateTotal();
-      document.getElementById('cust-name').value = '';
-      document.getElementById('cust-phone').value = '';
+      document.getElementById('cust-name').value = currentMember ? (currentMember.name || '') : '';
+      document.getElementById('cust-phone').value = currentMember ? (currentMember.phone || '') : '';
       document.getElementById('cust-notes').value = '';
       document.getElementById('cust-address').value = '';
       document.getElementById('delivery-distance-info').textContent = '';
