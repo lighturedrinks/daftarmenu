@@ -19,7 +19,7 @@
   <title>Lighture Drinks</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&amp;display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js" integrity="sha384-JNhb/AfQ8tCvhjfm2WXKx9qovmn7LcndXYllHYDf2CcTBaBMAiPsjRJeC3f9U8V6" crossorigin="anonymous"></script>
   <style>
     body { font-family: 'DM Sans', sans-serif; }
     .step { display: none; }
@@ -370,7 +370,6 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     </div>
    </div>
   </div>
-// Firebase Firestore + Auth backend
 <script>
     // ============================================================
     // Firebase Firestore + Auth backend
@@ -426,9 +425,22 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     }
 
     window.dataSdk = {
-      async createOrder(record) {
+      // Jika ada voucher: pembuatan order + penandaan voucher "terpakai" dilakukan
+      // dalam SATU transaksi atomik (voucher yang sudah terpakai akan ditolak).
+      async createOrder(record, voucher) {
         try {
-          await firestoreDb.collection(ORDERS_COLLECTION).add(record);
+          if (voucher && voucher.__backendId && voucher.owner_phone) {
+            const voucherRef = voucherCollectionFor(voucher.owner_phone).doc(voucher.__backendId);
+            const orderRef = firestoreDb.collection(ORDERS_COLLECTION).doc();
+            await firestoreDb.runTransaction(async (tx) => {
+              const vSnap = await tx.get(voucherRef);
+              if (!vSnap.exists || vSnap.data().used === true) throw new Error('Voucher sudah terpakai atau tidak valid.');
+              tx.set(orderRef, record);
+              tx.update(voucherRef, { used: true });
+            });
+          } else {
+            await firestoreDb.collection(ORDERS_COLLECTION).add(record);
+          }
           return { isOk: true };
         } catch (err) {
           return { isOk: false, error: { message: err.message } };
@@ -496,20 +508,24 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       },
       async redeemVoucher(member, catalogItem) {
         try {
-          if (member.points < catalogItem.cost) throw new Error('not-enough-points');
-          const batch = firestoreDb.batch();
-          batch.update(firestoreDb.collection(MEMBERS_COLLECTION).doc(member.__backendId), {
-            points: member.points - catalogItem.cost
+          // Transaksi: baca poin TERBARU dari server (bukan data lokal yang bisa basi)
+          const memberRef = firestoreDb.collection(MEMBERS_COLLECTION).doc(member.__backendId);
+          const voucherRef = voucherCollectionFor(member.__backendId).doc();
+          await firestoreDb.runTransaction(async (tx) => {
+            const snap = await tx.get(memberRef);
+            if (!snap.exists) throw new Error('member-not-found');
+            const pts = safeNum(snap.data().points);
+            if (pts < catalogItem.cost) throw new Error('not-enough-points');
+            tx.update(memberRef, { points: pts - catalogItem.cost });
+            tx.set(voucherRef, {
+              owner_phone: member.__backendId, // berisi uid
+              code: catalogItem.code,
+              label: catalogItem.label,
+              discount: catalogItem.discount,
+              obtained_at: new Date().toISOString(),
+              used: false
+            });
           });
-          batch.set(voucherCollectionFor(member.__backendId).doc(), {
-            owner_phone: member.__backendId, // berisi uid
-            code: catalogItem.code,
-            label: catalogItem.label,
-            discount: catalogItem.discount,
-            obtained_at: new Date().toISOString(),
-            used: false
-          });
-          await batch.commit();
           return { isOk: true };
         } catch (err) {
           return { isOk: false, error: { message: err.message } };
@@ -570,6 +586,57 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       { id: '6', name: 'SeaGlow', price: 12000 },
       { id: '7', name: 'Cloud Splash', price: 13000 }
     ];
+
+    // Nama lama yang masih mungkin ada di pesanan lama
+    const MENU_ALIASES = { 'BlueCean': '6', 'CheeMilk Boba': '3' };
+
+    // Hitung ulang isi pesanan dari teks items_ordered berdasarkan harga MENU di kode ini.
+    // JANGAN percaya drink_total / total_price kiriman klien.
+    function parseOrderItems(order) {
+      const text = typeof order.items_ordered === 'string' ? order.items_ordered : '';
+      if (!text) return { valid: false, drinkTotal: 0 };
+      let total = 0;
+      for (const part of text.split(', ')) {
+        const m = part.match(/^(.+) x(\d{1,3})$/);
+        if (!m) return { valid: false, drinkTotal: 0 };
+        const name = m[1].trim();
+        const qty = parseInt(m[2], 10);
+        const menuItem = MENU.find(x => x.name === name) || MENU.find(x => x.id === MENU_ALIASES[name]);
+        if (!menuItem || qty < 1) return { valid: false, drinkTotal: 0 };
+        total += menuItem.price * qty;
+      }
+      return { valid: true, drinkTotal: total };
+    }
+
+    // Kembalikan daftar masalah (kosong = konsisten)
+    function auditOrder(order) {
+      const issues = [];
+      const parsed = parseOrderItems(order);
+      if (!parsed.valid) { issues.push('Isi pesanan tidak bisa dibaca / menu tidak dikenal'); return issues; }
+      const fee = safeNum(order.delivery_fee);
+      const code = order.voucher_code || '';
+      const cat = code ? VOUCHER_CATALOG.find(v => v.code === code) : null;
+      if (code && !cat) issues.push('Kode voucher tidak dikenal');
+      const disc = cat ? cat.discount : 0;
+      const expectedTotal = Math.max(0, parsed.drinkTotal - disc) + fee;
+      if (safeNum(order.total_price) !== expectedTotal) {
+        issues.push('Total di pesanan Rp ' + safeNum(order.total_price).toLocaleString('id-ID') + ' ≠ hitungan ulang Rp ' + expectedTotal.toLocaleString('id-ID'));
+      }
+      if (order.drink_total != null && safeNum(order.drink_total) !== parsed.drinkTotal) {
+        issues.push('drink_total tidak cocok dengan isi pesanan');
+      }
+      if (order.delivery_lat != null && fee !== calcDeliveryFee(safeNum(order.delivery_distance_km))) {
+        issues.push('Ongkir tidak cocok dengan jarak tercatat');
+      }
+      if (fee < 0 || fee > 200000) issues.push('Ongkir tidak wajar');
+      return issues;
+    }
+
+    function auditOrderHtml(order) {
+      const issues = auditOrder(order);
+      if (!issues.length) return '';
+      return `<div class="mt-2 p-2 rounded-lg bg-red-50 border border-red-300 text-xs text-red-700"><strong>⚠️ Periksa pesanan ini:</strong><ul class="list-disc ml-4">${issues.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul></div>`;
+    }
 
     const cart = { '1': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 0 };
     // Anti-spam
@@ -925,6 +992,11 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
     document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePinModal(); closeProofModal(); } });
 
     function toggleAdmin() {
+      if (!isAdmin) {
+        // Jangan buka panel admin kalau sesi Google bukan admin (cegah panggil lewat console)
+        const u = firebaseAuth.currentUser;
+        if (!u || u.email !== ADMIN_GOOGLE_EMAIL) return;
+      }
       isAdmin = !isAdmin;
       document.getElementById('customer-view').classList.toggle('hidden', isAdmin);
       document.getElementById('admin-view').classList.toggle('hidden', !isAdmin);
@@ -946,7 +1018,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         el.innerHTML = `
           <div class="flex items-center gap-2 text-sm bg-white/80 rounded-full px-4 py-1.5 shadow-sm">
             <span>👋 Halo, <strong>${escapeHtml(currentMember.name)}</strong></span>
-            <span class="text-green-700 font-bold">• ${currentMember.points || 0} Poin</span>
+            <span class="text-green-700 font-bold">• ${safeNum(currentMember.points)} Poin</span>
             <button type="button" class="text-xs underline text-gray-500" onclick="openRedeemModal()">Tukar Poin</button>
             <button type="button" class="text-xs underline text-gray-400" onclick="logoutMember()">Logout</button>
           </div>`;
@@ -1055,7 +1127,14 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         .where('used', '==', false)
         .onSnapshot(
           (snapshot) => {
-            myVouchers = snapshot.docs.map(d => ({ ...d.data(), __backendId: d.id }));
+            // Nilai diskon/label SELALU diambil dari katalog di kode, bukan dari dokumen voucher
+            myVouchers = snapshot.docs
+              .map(d => ({ ...d.data(), __backendId: d.id }))
+              .map(v => {
+                const c = VOUCHER_CATALOG.find(x => x.code === v.code);
+                return c ? { ...v, label: c.label, discount: c.discount, owner_phone: currentMember ? currentMember.__backendId : v.owner_phone } : null;
+              })
+              .filter(Boolean);
             populateVoucherSelect();
             const rm = document.getElementById('redeem-modal');
             if (rm && !rm.classList.contains('hidden')) renderRedeemModal();
@@ -1083,7 +1162,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
     function renderRedeemModal() {
       if (!currentMember) return;
-      const pts = currentMember.points || 0;
+      const pts = safeNum(currentMember.points);
       document.getElementById('redeem-points-balance').textContent = `Poin kamu: ${pts}`;
       document.getElementById('redeem-voucher-list').innerHTML = VOUCHER_CATALOG.map(v => `
         <div class="flex items-center justify-between p-3 rounded-lg border border-gray-200">
@@ -1280,7 +1359,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         const aliases = { '6': ['SeaGlow', 'BlueCean'], '3': ['CheeMilk Tea', 'CheeMilk Boba'] };
         const names = aliases[itemId] || [menuName];
         filtered = allOrders.filter(order => {
-          const items = order.items_ordered.split(', ');
+          const items = String(order.items_ordered || '').split(', ');
           return items.some(item => names.some(n => item.includes(n)));
         });
       }
@@ -1330,14 +1409,16 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
             : '';
           deliveryInfo = `<p class="text-xs text-gray-600 mt-1">🚚 ${escapeHtml(order.delivery_address || '(alamat tidak diisi)')}` +
             distanceLabel +
-            (order.delivery_fee ? ` • Ongkir Rp ${Number(order.delivery_fee).toLocaleString('id-ID')}` : '') +
+            (order.delivery_fee ? ` • Ongkir Rp ${safeNum(order.delivery_fee).toLocaleString('id-ID')}` : '') +
             (mapLink ? ` • ${mapLink}` : '') + `</p>`;
         }
 
+        const auditWarn = auditOrderHtml(order);
         return `<div class="p-3 rounded-xl bg-white shadow-sm">
           <div class="flex justify-between items-start"><div><strong>${escapeHtml(order.customer_name)}</strong><br><span class="text-xs text-gray-500">${escapeHtml(order.phone_number)}</span><br><span class="text-xs text-gray-400">📅 ${dateStr}</span></div>
           <div class="flex flex-col gap-1 items-end"><span class="text-xs px-2 py-0.5 rounded-full ${sc[order.status] || sc.pending}">${st[order.status] || st.pending}</span><span class="text-xs px-2 py-0.5 rounded-full ${order.payment_method==='qris'?'bg-blue-100 text-blue-700':'bg-green-100 text-green-700'}">${order.payment_method==='qris'?'💳 QRIS':'💵 Tunai'}</span></div></div>
-          <p class="text-sm mt-1">${escapeHtml(order.items_ordered)}</p><p class="text-sm font-bold">Rp ${Number(order.total_price).toLocaleString('id-ID')}</p>
+          <p class="text-sm mt-1">${escapeHtml(order.items_ordered)}</p><p class="text-sm font-bold">Rp ${safeNum(order.total_price).toLocaleString('id-ID')}</p>
+          ${auditWarn}
           ${loyaltyInfo}
           ${deliveryInfo}
           ${proofSection}
@@ -1364,7 +1445,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
       const o = filtered;
       document.getElementById('report-total-orders-value').textContent = o.length;
-      document.getElementById('report-revenue-value').textContent = 'Rp ' + o.filter(x=>x.status!=='rejected').reduce((s,x)=>s+Number(x.total_price),0).toLocaleString('id-ID');
+      document.getElementById('report-revenue-value').textContent = 'Rp ' + o.filter(x=>x.status!=='rejected').reduce((s,x)=>s+safeNum(x.total_price),0).toLocaleString('id-ID');
       document.getElementById('report-pending-value').textContent = o.filter(x=>x.status==='pending').length;
       document.getElementById('report-confirmed-value').textContent = o.filter(x=>x.status==='confirmed').length;
       document.getElementById('report-preparing-value').textContent = o.filter(x=>x.status==='preparing').length;
@@ -1385,7 +1466,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         }
         dailyMap[dateKey].count++;
         if (order.status !== 'rejected') {
-          dailyMap[dateKey].revenue += Number(order.total_price) || 0;
+          dailyMap[dateKey].revenue += safeNum(order.total_price) || 0;
         }
         if (order.status === 'completed') {
           dailyMap[dateKey].completed++;
@@ -1442,20 +1523,25 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
         if (!order) return;
         actionBtn.disabled = true; actionBtn.textContent = '...';
         const newStatus = actionBtn.dataset.action;
-        await window.dataSdk.updateOrder({ ...order, status: newStatus });
-        // Poin diberikan sekali, hanya saat pesanan member berstatus selesai
-        if (newStatus === 'completed' && order.member_phone && !order.points_awarded) {
+        const prevStatus = order.status;
+        // Hanya kirim field status (jangan menimpa seluruh dokumen dengan data lokal yang bisa basi)
+        await window.dataSdk.updateOrder({ __backendId: order.__backendId, status: newStatus });
+        // Poin diberikan sekali, hanya saat pesanan member berstatus selesai.
+        // Besaran poin dihitung dari isi pesanan x harga menu di kode, BUKAN dari drink_total kiriman klien.
+        if (newStatus === 'completed' && prevStatus !== 'completed' && order.member_phone && !order.points_awarded) {
           try {
-            const memberDoc = await firestoreDb.collection(MEMBERS_COLLECTION).doc(order.member_phone).get();
-            if (memberDoc.exists) {
-              const member = { ...memberDoc.data(), __backendId: memberDoc.id };
-              const drinkBase = Number(order.drink_total ?? order.total_price);
-              const pointsEarned = Math.floor(drinkBase / 10000) * 10;
-              if (pointsEarned > 0) {
-                await memberDataSdk.awardPoints(member, pointsEarned);
+            const parsed = parseOrderItems(order);
+            const pointsEarned = parsed.valid ? Math.floor(parsed.drinkTotal / 10000) * 10 : 0;
+            const memberRef = firestoreDb.collection(MEMBERS_COLLECTION).doc(order.member_phone);
+            const orderRef = firestoreDb.collection(ORDERS_COLLECTION).doc(order.__backendId);
+            await firestoreDb.runTransaction(async (tx) => {
+              const [mSnap, oSnap] = await Promise.all([tx.get(memberRef), tx.get(orderRef)]);
+              if (!oSnap.exists || oSnap.data().points_awarded) return;   // cegah dobel
+              if (mSnap.exists && pointsEarned > 0) {
+                tx.update(memberRef, { points: firebase.firestore.FieldValue.increment(pointsEarned) });
               }
-              await window.dataSdk.updateOrder({ ...order, status: newStatus, points_awarded: true, points_awarded_amount: pointsEarned });
-            }
+              tx.update(orderRef, { points_awarded: true, points_awarded_amount: (mSnap.exists ? pointsEarned : 0) });
+            });
           } catch (err) {
             console.error('Award points failed:', err);
           }
@@ -1498,7 +1584,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
       let totalCups = 0;
       allOrders.forEach(order => {
         if (order.status === 'completed') {
-          const items = order.items_ordered.split(', ');
+          const items = String(order.items_ordered || '').split(', ');
           items.forEach(item => {
             const match = item.match(/x(\d+)$/);
             if (match) totalCups += parseInt(match[1], 10);
@@ -1652,6 +1738,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
           record_type: 'order',
           member_phone: memberUidForOrder, // berisi uid member
           voucher_code: voucherUsedForThisOrder ? voucherUsedForThisOrder.code : '',
+          voucher_id: voucherUsedForThisOrder ? voucherUsedForThisOrder.__backendId : '',
           points_awarded: false,
           delivery_address: address,
           delivery_lat: deliveryLocation ? deliveryLocation.lat : null,
@@ -1663,20 +1750,18 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
 
         const finishSuccess = (methodLabel) => {
           try { localStorage.setItem(LAST_ORDER_STORAGE_KEY, String(Date.now())); } catch (e) {}
-          if (voucherUsedForThisOrder) {
-            memberDataSdk.markVoucherUsed(voucherUsedForThisOrder).catch(() => {});
-            selectedVoucher = null;
-          }
+          // Voucher sudah ditandai terpakai secara atomik saat order dibuat
+          if (voucherUsedForThisOrder) selectedVoucher = null;
           let msg = `Pesanan Baru dari Lighture Drinks%0A%0A👤 ${encodeURIComponent(name)}%0A📞 ${encodeURIComponent(phone)}%0A%0A🛍️ ${encodeURIComponent(items)}%0A💰 Rp ${total.toLocaleString('id-ID')}%0A${methodLabel}`;
           if (address) msg += `%0A📍 ${encodeURIComponent(address)}`;
           if (deliveryFeeForOrder > 0) msg += `%0A🚚 Ongkir: Rp ${deliveryFeeForOrder.toLocaleString('id-ID')} (~${deliveryDistanceKm.toFixed(1)} km)`;
           if (notes) msg += `%0A📝 ${encodeURIComponent(notes)}`;
-          window.open(`https://wa.me/6285172296255?text=${msg}`, '_blank');
+          window.open(`https://wa.me/6285172296255?text=${msg}`, '_blank', 'noopener,noreferrer');
           goToStep(4);
         };
 
         if (selectedPaymentMethod === 'cash') {
-          const result = await window.dataSdk.createOrder(buildOrder('', ''));
+          const result = await window.dataSdk.createOrder(buildOrder('', ''), voucherUsedForThisOrder);
           resetBtn();
           if (result.isOk) finishSuccess('💵 Tunai');
           else showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
@@ -1695,7 +1780,7 @@ Botol 250ml</span> <span data-template-id="item7-desc" class="canva-text text-xs
                 return;
               }
               const proofHash = generateHash(proofBase64);
-              const result = await window.dataSdk.createOrder(buildOrder(proofHash, proofBase64));
+              const result = await window.dataSdk.createOrder(buildOrder(proofHash, proofBase64), voucherUsedForThisOrder);
               resetBtn();
               if (result.isOk) finishSuccess('💳 QRIS');
               else showError('error-msg', result.error?.message || 'Gagal mengirim pesanan. Coba lagi.');
